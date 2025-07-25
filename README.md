@@ -5,3 +5,5 @@
 [环境部署文档](docs/项目部署.md)
 
 [训练营作业介绍文档](docs/训练营作业介绍.md)
+
+[训练营作业报告模版](docs/TinyInfiniTrain%20作业报告.md)
