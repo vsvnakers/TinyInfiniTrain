@@ -29,7 +29,66 @@ std::shared_ptr<Tensor> MatmulForward(const std::shared_ptr<Tensor> &input, cons
     // REF:
     // =================================== 作业 ===================================
 
-    auto output = std::make_shared<Tensor>();
+    // ================================
+    // 参数检查与维度解析
+    // ================================
+    const auto &input_dims = input->Dims();    // 输入张量形状 (... x M x K)
+    const auto &other_dims = other->Dims();    // 右矩阵形状 (... x K x N)
+
+    CHECK_GE(input_dims.size(), 2);            // input 至少二维
+    CHECK_GE(other_dims.size(), 2);            // other 至少二维
+    CHECK_EQ(input_dims.back(), other_dims[other_dims.size() - 2]); // K 匹配
+
+    // 行列数
+    const int64_t M = input_dims[input_dims.size() - 2]; // A 的行数
+    const int64_t K = input_dims.back();                 // A 的列数 = B 的行数
+    const int64_t N = other_dims.back();                 // B 的列数
+
+    // 批量个数：总元素数 / (M*K)
+    const int64_t num_batches = input->NumElements() / (M * K);
+    CHECK_EQ(other->NumElements(), num_batches * K * N); // B 的元素数要匹配
+
+    // ================================
+    // 构造输出张量 (... x M x N)
+    // ================================
+    auto output_dims = input_dims;
+    output_dims.back() = N; // 最后一维替换为 N
+    auto output = std::make_shared<Tensor>(output_dims, DataType::kFLOAT32, input->GetDevice());
+
+    // cuBLAS GEMM 系数
+    const float alpha = 1.0f;   // y = alpha * A*B + beta * C
+    const float beta  = 0.0f;
+
+    // 创建 cuBLAS handle
+    cublasHandle_t handle;
+    CUBLAS_CHECK(cublasCreate(&handle));
+
+    // ================================
+    // Stride（跨距），用于批量矩阵乘法
+    // ================================
+    const int64_t strideA = K * N;  // 每个 B 矩阵的元素数
+    const int64_t strideB = M * K;  // 每个 A 矩阵的元素数
+    const int64_t strideC = M * N;  // 每个 C 矩阵的元素数
+
+    // ================================
+    // 批量矩阵乘法：C = A * B
+    // 调用 cuBLAS SgemmStridedBatched
+    // ================================
+    CUBLAS_CHECK(cublasSgemmStridedBatched(
+        handle,
+        CUBLAS_OP_N, CUBLAS_OP_N,    // 不转置
+        (int)N, (int)M, (int)K,      // 矩阵维度：C[MxN] = A[MxK] * B[KxN]
+        &alpha,
+        static_cast<const float*>(other->DataPtr()), (int)N, strideA, // B
+        static_cast<const float*>(input->DataPtr()), (int)K, strideB, // A
+        &beta,
+        static_cast<float*>(output->DataPtr()), (int)N, strideC,      // C
+        (int)num_batches));                                           // 批数
+
+    // 销毁 cuBLAS handle
+    CUBLAS_CHECK(cublasDestroy(handle));
+
+    // 返回结果张量
     return output;
 }
 
@@ -40,9 +99,63 @@ MatmulBackward(const std::shared_ptr<Tensor> &input, const std::shared_ptr<Tenso
     // TODO：实现CUDA上的矩阵乘法反向传播
     // REF:
     // =================================== 作业 ===================================
+    // grad_input = grad_output * other^T
+    // grad_other = input^T * grad_output
 
-    auto grad_input = std::make_shared<Tensor>();
-    auto grad_other = std::make_shared<Tensor>();
+    const auto &input_dims = input->Dims();
+    const auto &other_dims = other->Dims();
+    const auto &grad_dims = grad_output->Dims();
+
+    CHECK_GE(input_dims.size(), 2);
+    CHECK_GE(other_dims.size(), 2);
+    CHECK_GE(grad_dims.size(), 2);
+
+    const int64_t M = input_dims[input_dims.size() - 2];
+    const int64_t K = input_dims.back();
+    const int64_t N = other_dims.back();
+
+    CHECK_EQ(grad_dims[grad_dims.size() - 2], M);
+    CHECK_EQ(grad_dims.back(), N);
+    CHECK_EQ(other_dims[other_dims.size() - 2], K);
+
+    const int64_t num_batches = input->NumElements() / (M * K);
+
+    CHECK_EQ(other->NumElements(), num_batches * K * N);
+    CHECK_EQ(grad_output->NumElements(), num_batches * M * N);
+
+    auto grad_input = std::make_shared<Tensor>(input_dims, DataType::kFLOAT32, input->GetDevice());
+    auto grad_other = std::make_shared<Tensor>(other_dims, DataType::kFLOAT32, other->GetDevice());
+
+    const float alpha = 1.0f;
+    const float beta0 = 0.0f;
+    cublasHandle_t handle; CUBLAS_CHECK(cublasCreate(&handle));
+
+    const int64_t strideOther = K * N;
+    const int64_t strideGradOut = M * N;
+    const int64_t strideGradIn = M * K;
+    CUBLAS_CHECK(cublasSgemmStridedBatched(handle,
+                                           CUBLAS_OP_T, CUBLAS_OP_N,
+                                           (int)K, (int)M, (int)N,
+                                           &alpha,
+                                           static_cast<const float*>(other->DataPtr()), (int)N, strideOther,
+                                           static_cast<const float*>(grad_output->DataPtr()), (int)N, strideGradOut,
+                                           &beta0,
+                                           static_cast<float*>(grad_input->DataPtr()), (int)K, strideGradIn,
+                                           (int)num_batches));
+
+    const int64_t strideInput = M * K;
+    const int64_t strideGradOther = K * N;
+    CUBLAS_CHECK(cublasSgemmStridedBatched(handle,
+                                           CUBLAS_OP_N, CUBLAS_OP_T,
+                                           (int)N, (int)K, (int)M,
+                                           &alpha,
+                                           static_cast<const float*>(grad_output->DataPtr()), (int)N, strideGradOut,
+                                           static_cast<const float*>(input->DataPtr()), (int)K, strideInput,
+                                           &beta0,
+                                           static_cast<float*>(grad_other->DataPtr()), (int)N, strideGradOther,
+                                           (int)num_batches));
+
+    CUBLAS_CHECK(cublasDestroy(handle));
     return {grad_input, grad_other};
 }
 
